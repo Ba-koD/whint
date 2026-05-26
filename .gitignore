@@ -1,0 +1,10 @@
+node_modules/
+dist/
+.vite/
+.cache/
+coverage/
+*.tsbuildinfo
+npm-debug.log*
+.vite-dev*.log
+public/words.json
+public/word-source.json
