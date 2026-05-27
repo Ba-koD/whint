@@ -4,6 +4,22 @@ export const WORD_LENGTH = 5;
 export const MAX_GUESSES = 6;
 
 const ACTIVE_STATES: Exclude<CellState, "blank">[] = ["absent", "present", "correct"];
+const ENTROPY_SOLVE_BONUS = 0.08;
+const ENTROPY_UNUSED_FREQUENCY_WEIGHT = 0.035;
+const ENTROPY_UNUSED_POSITION_WEIGHT = 0.025;
+const ENTROPY_UNUSED_COUNT_WEIGHT = 0.015;
+const FREQUENCY_POSITION_WEIGHT = 0.8;
+const FREQUENCY_COVERAGE_WEIGHT = 0.25;
+const FREQUENCY_UNUSED_FREQUENCY_WEIGHT = 0.65;
+const FREQUENCY_UNUSED_POSITION_WEIGHT = 0.45;
+const FREQUENCY_UNUSED_COUNT_WEIGHT = 0.12;
+const FREQUENCY_DUPLICATE_PENALTY = 0.15;
+
+interface LetterStats {
+  positionCounts: Map<string, number>[];
+  uniqueCounts: Map<string, number>;
+  total: number;
+}
 
 export function createEmptyGrid(): Grid {
   return Array.from({ length: MAX_GUESSES }, () =>
@@ -101,14 +117,30 @@ export function filterCandidates(words: string[], grid: Grid): string[] {
 
 export function getRecommendations(words: string[], grid: Grid, limit = 30): Recommendation[] {
   const candidates = filterCandidates(words, grid);
+  const usedLetters = getUsedLetters(grid);
+  const normalizedWords = uniqueWords(
+    words.map(normalizeWord).filter((word) => word.length === WORD_LENGTH),
+  );
+  const playableWords = normalizedWords.filter((word) => guessRespectsKnownHints(word, grid));
+  const guesses = uniqueWords([...candidates, ...playableWords]);
+
+  if (candidates.length === 0) {
+    return [];
+  }
+
   if (candidates.length <= 1) {
     return candidates.map((word) => ({ word, score: 1, method: "frequency" as const }));
   }
 
-  const recommendations =
-    candidates.length <= 700
-      ? rankByEntropy(candidates)
-      : rankByLetterFrequency(candidates);
+  const recommendations = (() => {
+    if (candidates.length <= 250) {
+      return rankByEntropy(guesses, candidates, usedLetters);
+    }
+    if (candidates.length <= 700) {
+      return rankByEntropy(buildProbePool(guesses, candidates, 650, usedLetters), candidates, usedLetters);
+    }
+    return rankByLetterFrequency(guesses, candidates, usedLetters);
+  })();
 
   return recommendations.slice(0, limit);
 }
@@ -142,31 +174,96 @@ export function getCandidateEvidence(word: string, grid: Grid): Exclude<CellStat
   });
 }
 
-function rankByEntropy(candidates: string[]): Recommendation[] {
-  return candidates
+function rankByEntropy(
+  guesses: string[],
+  answers: string[],
+  usedLetters = new Set<string>(),
+): Recommendation[] {
+  const answerSet = new Set(answers);
+  const stats = buildLetterStats(answers);
+
+  return guesses
     .map((guess) => {
       const buckets = new Map<string, number>();
-      for (const answer of candidates) {
+      for (const answer of answers) {
         const key = feedbackFor(guess, answer).map(stateKey).join("");
         buckets.set(key, (buckets.get(key) ?? 0) + 1);
       }
 
       let entropy = 0;
       for (const size of buckets.values()) {
-        const probability = size / candidates.length;
+        const probability = size / answers.length;
         entropy -= probability * Math.log2(probability);
       }
 
-      return { word: guess, score: entropy, method: "entropy" as const };
+      const solveBonus = answerSet.has(guess) ? ENTROPY_SOLVE_BONUS : 0;
+      const explorationBonus = scoreUnusedLetterCoverage(guess, stats, usedLetters);
+      return { word: guess, score: entropy + solveBonus + explorationBonus, method: "entropy" as const };
     })
     .sort(compareRecommendations);
 }
 
-function rankByLetterFrequency(candidates: string[]): Recommendation[] {
+function buildProbePool(
+  words: string[],
+  candidates: string[],
+  limit: number,
+  usedLetters = new Set<string>(),
+): string[] {
+  return uniqueWords([
+    ...candidates,
+    ...rankByLetterFrequency(words, candidates, usedLetters)
+      .slice(0, limit)
+      .map((item) => item.word),
+  ]);
+}
+
+function rankByLetterFrequency(
+  guesses: string[],
+  referenceWords = guesses,
+  usedLetters = new Set<string>(),
+): Recommendation[] {
+  const stats = buildLetterStats(referenceWords);
+
+  return guesses
+    .map((word) => {
+      const uniqueLetters = new Set(word);
+      const { coverageScore, unusedCoverageScore, unusedLetterCount } = getLetterCoverageScores(
+        uniqueLetters,
+        stats,
+        usedLetters,
+      );
+      const { positionScore, unusedPositionScore } = getPositionCoverageScores(
+        word,
+        stats,
+        usedLetters,
+      );
+      const duplicatePenalty = WORD_LENGTH - uniqueLetters.size;
+
+      return {
+        word,
+        score:
+          positionScore * FREQUENCY_POSITION_WEIGHT +
+          coverageScore * FREQUENCY_COVERAGE_WEIGHT +
+          unusedCoverageScore * FREQUENCY_UNUSED_FREQUENCY_WEIGHT +
+          unusedPositionScore * FREQUENCY_UNUSED_POSITION_WEIGHT +
+          unusedLetterCount * FREQUENCY_UNUSED_COUNT_WEIGHT -
+          duplicatePenalty * FREQUENCY_DUPLICATE_PENALTY,
+        method: "frequency" as const,
+      };
+    })
+    .sort(compareRecommendations);
+}
+
+function uniqueWords(words: string[]): string[] {
+  return [...new Set(words)];
+}
+
+function buildLetterStats(referenceWords: string[]): LetterStats {
+  const total = Math.max(referenceWords.length, 1);
   const positionCounts = Array.from({ length: WORD_LENGTH }, () => new Map<string, number>());
   const uniqueCounts = new Map<string, number>();
 
-  for (const word of candidates) {
+  for (const word of referenceWords) {
     const seen = new Set<string>();
     for (let index = 0; index < WORD_LENGTH; index += 1) {
       const letter = word[index];
@@ -178,32 +275,176 @@ function rankByLetterFrequency(candidates: string[]): Recommendation[] {
     }
   }
 
-  return candidates
-    .map((word) => {
-      const uniqueLetters = new Set(word);
-      const positionScore = [...word].reduce(
-        (sum, letter, index) => sum + (positionCounts[index].get(letter) ?? 0) / candidates.length,
-        0,
-      );
-      const coverageScore =
-        [...uniqueLetters].reduce((sum, letter) => sum + (uniqueCounts.get(letter) ?? 0), 0) /
-        candidates.length;
-      const duplicatePenalty = WORD_LENGTH - uniqueLetters.size;
+  return { positionCounts, uniqueCounts, total };
+}
 
-      return {
-        word,
-        score: positionScore + coverageScore * 0.35 - duplicatePenalty * 0.15,
-        method: "frequency" as const,
-      };
-    })
-    .sort(compareRecommendations);
+function getLetterCoverageScores(
+  uniqueLetters: Set<string>,
+  stats: LetterStats,
+  usedLetters: Set<string>,
+) {
+  let coverageScore = 0;
+  let unusedCoverageScore = 0;
+  let unusedLetterCount = 0;
+
+  for (const letter of uniqueLetters) {
+    const letterFrequency = (stats.uniqueCounts.get(letter) ?? 0) / stats.total;
+    coverageScore += letterFrequency;
+
+    if (!usedLetters.has(letter)) {
+      unusedCoverageScore += letterFrequency;
+      unusedLetterCount += 1;
+    }
+  }
+
+  return { coverageScore, unusedCoverageScore, unusedLetterCount };
+}
+
+function getPositionCoverageScores(word: string, stats: LetterStats, usedLetters: Set<string>) {
+  let positionScore = 0;
+  let unusedPositionScore = 0;
+
+  for (let index = 0; index < WORD_LENGTH; index += 1) {
+    const letter = word[index];
+    const positionFrequency = (stats.positionCounts[index].get(letter) ?? 0) / stats.total;
+    positionScore += positionFrequency;
+
+    if (!usedLetters.has(letter)) {
+      unusedPositionScore += positionFrequency;
+    }
+  }
+
+  return { positionScore, unusedPositionScore };
+}
+
+function scoreUnusedLetterCoverage(word: string, stats: LetterStats, usedLetters: Set<string>): number {
+  const { unusedCoverageScore, unusedLetterCount } = getLetterCoverageScores(
+    new Set(word),
+    stats,
+    usedLetters,
+  );
+  const { unusedPositionScore } = getPositionCoverageScores(word, stats, usedLetters);
+  return (
+    unusedCoverageScore * ENTROPY_UNUSED_FREQUENCY_WEIGHT +
+    unusedPositionScore * ENTROPY_UNUSED_POSITION_WEIGHT +
+    unusedLetterCount * ENTROPY_UNUSED_COUNT_WEIGHT
+  );
+}
+
+function getUsedLetters(grid: Grid): Set<string> {
+  const usedLetters = new Set<string>();
+
+  for (const row of grid) {
+    for (const cell of row) {
+      const letter = cell.letter.toLowerCase();
+      if (/^[a-z]$/.test(letter) && ACTIVE_STATES.includes(cell.state as never)) {
+        usedLetters.add(letter);
+      }
+    }
+  }
+
+  return usedLetters;
+}
+
+function guessRespectsKnownHints(word: string, grid: Grid): boolean {
+  const fixedByPosition = new Map<number, string>();
+  const disallowedPositions = new Map<string, Set<number>>();
+  const bannedLetters = new Set<string>();
+  const minCounts = new Map<string, number>();
+
+  for (const row of grid) {
+    const rowLetters = row.map((cell) => cell.letter.toLowerCase());
+    const confirmedCounts = new Map<string, number>();
+
+    for (let index = 0; index < WORD_LENGTH; index += 1) {
+      const letter = rowLetters[index];
+      const state = row[index].state;
+      if (!/^[a-z]$/.test(letter) || state === "blank") {
+        continue;
+      }
+
+      if (state === "correct") {
+        fixedByPosition.set(index, letter);
+        confirmedCounts.set(letter, (confirmedCounts.get(letter) ?? 0) + 1);
+      } else if (state === "present") {
+        addDisallowedPosition(disallowedPositions, letter, index);
+        confirmedCounts.set(letter, (confirmedCounts.get(letter) ?? 0) + 1);
+      } else {
+        bannedLetters.add(letter);
+      }
+    }
+
+    for (const [letter, count] of confirmedCounts) {
+      minCounts.set(letter, Math.max(minCounts.get(letter) ?? 0, count));
+    }
+  }
+
+  for (const letter of bannedLetters) {
+    if (word.includes(letter)) {
+      return false;
+    }
+  }
+
+  for (const [position, letter] of fixedByPosition) {
+    if (word[position] !== letter) {
+      return false;
+    }
+  }
+
+  for (const [letter, positions] of disallowedPositions) {
+    for (const position of positions) {
+      if (word[position] === letter) {
+        return false;
+      }
+    }
+  }
+
+  for (const [letter, count] of minCounts) {
+    if (countLetters(word, letter) < count) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+function addDisallowedPosition(
+  positionsByLetter: Map<string, Set<number>>,
+  letter: string,
+  position: number,
+) {
+  const positions = positionsByLetter.get(letter) ?? new Set<number>();
+  positions.add(position);
+  positionsByLetter.set(letter, positions);
+}
+
+function countLetters(word: string, letter: string): number {
+  let count = 0;
+  for (const current of word) {
+    if (current === letter) {
+      count += 1;
+    }
+  }
+  return count;
 }
 
 function compareRecommendations(a: Recommendation, b: Recommendation): number {
-  if (b.score !== a.score) {
-    return b.score - a.score;
+  const scoreDifference = b.score - a.score;
+  if (Math.abs(scoreDifference) <= 0.005) {
+    const duplicateDifference = repeatedLetterCount(a.word) - repeatedLetterCount(b.word);
+    if (duplicateDifference !== 0) {
+      return duplicateDifference;
+    }
+  }
+
+  if (scoreDifference !== 0) {
+    return scoreDifference;
   }
   return a.word.localeCompare(b.word);
+}
+
+function repeatedLetterCount(word: string): number {
+  return WORD_LENGTH - new Set(word).size;
 }
 
 function stateKey(state: Exclude<CellState, "blank">): string {

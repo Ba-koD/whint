@@ -1,24 +1,46 @@
-import { ClipboardPaste, ImageUp, RotateCcw } from "lucide-react";
+import {
+  ClipboardPaste,
+  ImageUp,
+  RefreshCw,
+  RotateCcw,
+  ScreenShare,
+  ScreenShareOff,
+} from "lucide-react";
 import { useState } from "react";
 import type { RecognitionProgress } from "../lib/imageRecognition";
 
 interface ImageImportProps {
   isBusy: boolean;
+  isScreenSharing: boolean;
   progress: RecognitionProgress | null;
   warnings: string[];
   onClear: () => void;
   onFile: (file: File) => void;
+  onForceScreenRecognition: () => void;
+  onStartScreenShare: () => void;
+  onStopScreenShare: () => void;
 }
 
-export function ImageImport({ isBusy, progress, warnings, onClear, onFile }: ImageImportProps) {
+export function ImageImport({
+  isBusy,
+  isScreenSharing,
+  progress,
+  warnings,
+  onClear,
+  onFile,
+  onForceScreenRecognition,
+  onStartScreenShare,
+  onStopScreenShare,
+}: ImageImportProps) {
   const [isDragging, setIsDragging] = useState(false);
+  const isFileDisabled = isBusy || isScreenSharing;
 
   const handleDrop = (event: React.DragEvent<HTMLElement>) => {
     event.preventDefault();
     setIsDragging(false);
 
     const file = Array.from(event.dataTransfer.files).find((item) => item.type.startsWith("image/"));
-    if (file && !isBusy) {
+    if (file && !isFileDisabled) {
       onFile(file);
     }
   };
@@ -45,7 +67,7 @@ export function ImageImport({ isBusy, progress, warnings, onClear, onFile }: Ima
           <span>업로드</span>
           <input
             accept="image/*"
-            disabled={isBusy}
+            disabled={isFileDisabled}
             type="file"
             onChange={(event) => {
               const file = event.target.files?.[0];
@@ -60,11 +82,31 @@ export function ImageImport({ isBusy, progress, warnings, onClear, onFile }: Ima
           <ClipboardPaste size={18} />
           <span>붙여넣기</span>
         </div>
-        <button className="icon-button ghost-button" type="button" onClick={onClear}>
-          <RotateCcw size={18} />
-          <span>초기화</span>
+        <button
+          className={`icon-button screen-button ${isScreenSharing ? "is-live" : ""}`}
+          disabled={isBusy && !isScreenSharing}
+          type="button"
+          onClick={isScreenSharing ? onStopScreenShare : onStartScreenShare}
+        >
+          {isScreenSharing ? <ScreenShareOff size={18} /> : <ScreenShare size={18} />}
+          <span>{isScreenSharing ? "중지" : "화면"}</span>
+        </button>
+        <button
+          className="icon-button ghost-button"
+          disabled={isBusy && isScreenSharing}
+          type="button"
+          onClick={isScreenSharing ? onForceScreenRecognition : onClear}
+        >
+          {isScreenSharing ? <RefreshCw size={18} /> : <RotateCcw size={18} />}
+          <span>{isScreenSharing ? "재인식" : "초기화"}</span>
         </button>
       </div>
+      {isScreenSharing && !isBusy && (
+        <div className="live-status" role="status">
+          <span />
+          <strong>화면 공유 중</strong>
+        </div>
+      )}
       {isBusy && (
         <div className="progress-wrap" role="status">
           <div className="progress-line">

@@ -1,8 +1,12 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { BoardGrid, type BoardTool } from "./components/BoardGrid";
 import { ImageImport } from "./components/ImageImport";
 import { ResultsPanel } from "./components/ResultsPanel";
-import { recognizeBoardFromImage, type RecognitionProgress } from "./lib/imageRecognition";
+import {
+  recognizeBoardFromCanvas,
+  recognizeBoardFromImage,
+  type RecognitionProgress,
+} from "./lib/imageRecognition";
 import type { CellState, Grid, WordSource } from "./lib/types";
 import {
   createEmptyGrid,
@@ -15,6 +19,12 @@ import {
 import { loadWordData } from "./lib/wordData";
 
 const STORAGE_KEY = "whint.state.v1";
+const LIVE_CAPTURE_INTERVAL_MS = 1600;
+const LIVE_CAPTURE_MAX_EDGE = 1800;
+const LIVE_OCR_RETRY_INTERVAL_MS = 8000;
+const LIVE_OCR_REFRESH_INTERVAL_MS = 12000;
+const LIVE_STABLE_FRAME_DELAY_MS = 450;
+const LIVE_REQUIRED_STABLE_FRAMES = 2;
 
 interface SavedState {
   grid: Grid;
@@ -28,9 +38,17 @@ export default function App() {
   const [source, setSource] = useState<WordSource | null>(null);
   const [loadError, setLoadError] = useState("");
   const [isRecognizing, setIsRecognizing] = useState(false);
+  const [isScreenSharing, setIsScreenSharing] = useState(false);
+  const [liveRecognitionRequestId, setLiveRecognitionRequestId] = useState(0);
   const [progress, setProgress] = useState<RecognitionProgress | null>(null);
   const [warnings, setWarnings] = useState<string[]>([]);
   const [activeTool, setActiveTool] = useState<BoardTool>(savedState?.activeTool ?? "letter");
+  const screenStreamRef = useRef<MediaStream | null>(null);
+  const screenVideoRef = useRef<HTMLVideoElement | null>(null);
+  const liveRecognizedSignatureRef = useRef("");
+  const liveRecognizedAtRef = useRef(0);
+  const liveOcrAttemptRef = useRef<{ signature: string; time: number } | null>(null);
+  const livePendingSignatureRef = useRef({ signature: "", count: 0 });
 
   useEffect(() => {
     loadWordData()
@@ -140,27 +158,246 @@ export default function App() {
     }
   }, []);
 
+  const stopScreenShare = useCallback(() => {
+    const stream = screenStreamRef.current;
+    screenStreamRef.current = null;
+    stream?.getTracks().forEach((track) => track.stop());
+
+    const video = screenVideoRef.current;
+    if (video) {
+      video.pause();
+      video.srcObject = null;
+      video.remove();
+      screenVideoRef.current = null;
+    }
+
+    liveRecognizedSignatureRef.current = "";
+    liveRecognizedAtRef.current = 0;
+    liveOcrAttemptRef.current = null;
+    livePendingSignatureRef.current = { signature: "", count: 0 };
+    setIsScreenSharing(false);
+    setIsRecognizing(false);
+    setProgress(null);
+  }, []);
+
+  const startScreenShare = useCallback(async () => {
+    if (!navigator.mediaDevices?.getDisplayMedia) {
+      setWarnings(["이 브라우저에서는 화면 공유를 사용할 수 없습니다."]);
+      return;
+    }
+
+    stopScreenShare();
+    try {
+      const stream = await navigator.mediaDevices.getDisplayMedia({
+        audio: false,
+        video: {
+          frameRate: { ideal: 2, max: 5 },
+        },
+      });
+      const video = document.createElement("video");
+      video.muted = true;
+      video.playsInline = true;
+      video.srcObject = stream;
+
+      screenStreamRef.current = stream;
+      screenVideoRef.current = video;
+      liveRecognizedSignatureRef.current = "";
+      liveRecognizedAtRef.current = 0;
+      liveOcrAttemptRef.current = null;
+      livePendingSignatureRef.current = { signature: "", count: 0 };
+      stream.getVideoTracks().forEach((track) => {
+        track.addEventListener("ended", stopScreenShare, { once: true });
+      });
+
+      setWarnings([]);
+      setProgress({ phase: "image", message: "화면 공유 대기", progress: 0 });
+      await video.play();
+      setIsScreenSharing(true);
+    } catch (error) {
+      stopScreenShare();
+      const message =
+        error instanceof DOMException && error.name === "NotAllowedError"
+          ? "화면 공유 권한이 취소되었습니다."
+          : error instanceof Error
+            ? error.message
+            : "화면 공유를 시작하지 못했습니다.";
+      setWarnings([message]);
+    }
+  }, [stopScreenShare]);
+
+  const forceScreenRecognition = useCallback(() => {
+    if (!isScreenSharing) {
+      return;
+    }
+
+    liveRecognizedSignatureRef.current = "";
+    liveRecognizedAtRef.current = 0;
+    liveOcrAttemptRef.current = null;
+    setWarnings([]);
+    setProgress({ phase: "image", message: "재인식 대기", progress: 0 });
+    setLiveRecognitionRequestId((requestId) => requestId + 1);
+  }, [isScreenSharing]);
+
+  useEffect(() => {
+    if (!isScreenSharing) {
+      return;
+    }
+
+    let cancelled = false;
+    let timeoutId: number | null = null;
+
+    const queueNext = (delay = LIVE_CAPTURE_INTERVAL_MS) => {
+      if (!cancelled) {
+        timeoutId = window.setTimeout(run, delay);
+      }
+    };
+
+    const run = async () => {
+      let manuallyQueuedNext = false;
+      const video = screenVideoRef.current;
+      if (
+        !video ||
+        video.readyState < 2 ||
+        video.videoWidth === 0 ||
+        video.videoHeight === 0
+      ) {
+        timeoutId = window.setTimeout(run, 350);
+        return;
+      }
+
+      setIsRecognizing(true);
+      setProgress({ phase: "image", message: "화면 분석", progress: 0.03 });
+      try {
+        const frame = captureVideoFrame(video);
+        const preview = await recognizeBoardFromCanvas(
+          frame,
+          (nextProgress) => {
+            if (!cancelled) {
+              setProgress(nextProgress);
+            }
+          },
+          { recognizeLetters: false },
+        );
+        const signature = gridStateSignature(preview.grid);
+        const now = Date.now();
+        if (!hasColoredTiles(preview.grid)) {
+          if (!cancelled) {
+            setGrid(createEmptyGrid());
+            setWarnings([]);
+            liveRecognizedSignatureRef.current = "";
+            liveRecognizedAtRef.current = 0;
+            liveOcrAttemptRef.current = null;
+            livePendingSignatureRef.current = { signature: "", count: 0 };
+            setProgress({ phase: "done", message: "새 게임 감지", progress: 1 });
+          }
+          return;
+        }
+
+        const stableCount = updateStableSignature(signature, livePendingSignatureRef);
+        if (stableCount < LIVE_REQUIRED_STABLE_FRAMES) {
+          if (!cancelled) {
+            setGrid((current) => mergeGridStates(current, preview.grid));
+            setWarnings(preview.warnings);
+            setProgress({ phase: "image", message: "그리드 안정화", progress: 0.18 });
+            manuallyQueuedNext = true;
+            queueNext(LIVE_STABLE_FRAME_DELAY_MS);
+          }
+          return;
+        }
+
+        if (
+          signature === liveRecognizedSignatureRef.current &&
+          now - liveRecognizedAtRef.current < LIVE_OCR_REFRESH_INTERVAL_MS
+        ) {
+          if (!cancelled) {
+            setWarnings(preview.warnings);
+            setProgress({ phase: "done", message: "변경 없음", progress: 1 });
+          }
+          return;
+        }
+
+        const lastAttempt = liveOcrAttemptRef.current;
+        if (
+          lastAttempt?.signature === signature &&
+          now - lastAttempt.time < LIVE_OCR_RETRY_INTERVAL_MS
+        ) {
+          if (!cancelled) {
+            setGrid((current) => mergeGridStates(current, preview.grid));
+            setWarnings(preview.warnings);
+            setProgress({ phase: "done", message: "OCR 대기", progress: 1 });
+          }
+          return;
+        }
+
+        liveOcrAttemptRef.current = { signature, time: now };
+        const result = await recognizeBoardFromCanvas(frame, (nextProgress) => {
+          if (!cancelled) {
+            setProgress(nextProgress);
+          }
+        });
+        if (!cancelled) {
+          setGrid(result.grid);
+          setWarnings(result.warnings);
+          if (hasCompleteRecognizedLetters(result.grid)) {
+            liveRecognizedSignatureRef.current = signature;
+            liveRecognizedAtRef.current = Date.now();
+            liveOcrAttemptRef.current = null;
+          }
+        }
+      } catch (error) {
+        if (!cancelled) {
+          setWarnings([error instanceof Error ? error.message : "화면 인식에 실패했습니다."]);
+        }
+      } finally {
+        if (!cancelled) {
+          setIsRecognizing(false);
+          if (!manuallyQueuedNext) {
+            queueNext();
+          }
+        }
+      }
+    };
+
+    void run();
+
+    return () => {
+      cancelled = true;
+      if (timeoutId !== null) {
+        window.clearTimeout(timeoutId);
+      }
+    };
+  }, [isScreenSharing, liveRecognitionRequestId]);
+
+  useEffect(() => {
+    return () => {
+      screenStreamRef.current?.getTracks().forEach((track) => track.stop());
+    };
+  }, []);
+
   useEffect(() => {
     const onPaste = (event: ClipboardEvent) => {
       const file = Array.from(event.clipboardData?.files ?? []).find((item) =>
         item.type.startsWith("image/"),
       );
-      if (file) {
+      if (file && !isScreenSharing) {
         event.preventDefault();
         void handleImageFile(file);
       }
     };
     window.addEventListener("paste", onPaste);
     return () => window.removeEventListener("paste", onPaste);
-  }, [handleImageFile]);
+  }, [handleImageFile, isScreenSharing]);
 
   const clearGrid = useCallback(() => {
+    if (isScreenSharing) {
+      stopScreenShare();
+    }
     setGrid(createEmptyGrid());
     setWarnings([]);
     setProgress(null);
     setActiveTool("letter");
     localStorage.removeItem(STORAGE_KEY);
-  }, []);
+  }, [isScreenSharing, stopScreenShare]);
 
   return (
     <main className="app-shell">
@@ -184,10 +421,14 @@ export default function App() {
           />
           <ImageImport
             isBusy={isRecognizing}
+            isScreenSharing={isScreenSharing}
             progress={progress}
             warnings={warnings}
             onClear={clearGrid}
             onFile={handleImageFile}
+            onForceScreenRecognition={forceScreenRecognition}
+            onStartScreenShare={startScreenShare}
+            onStopScreenShare={stopScreenShare}
           />
           {loadError && <p className="error-message">{loadError}</p>}
           {source && (
@@ -205,6 +446,67 @@ export default function App() {
         />
       </section>
     </main>
+  );
+}
+
+function captureVideoFrame(video: HTMLVideoElement): HTMLCanvasElement {
+  const sourceWidth = video.videoWidth;
+  const sourceHeight = video.videoHeight;
+  const scale = Math.min(1, LIVE_CAPTURE_MAX_EDGE / Math.max(sourceWidth, sourceHeight));
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.max(1, Math.round(sourceWidth * scale));
+  canvas.height = Math.max(1, Math.round(sourceHeight * scale));
+
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  if (!ctx) {
+    throw new Error("화면 프레임을 읽을 수 없습니다.");
+  }
+
+  ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+  return canvas;
+}
+
+function gridStateSignature(grid: Grid): string {
+  return grid.map((row) => row.map((cell) => cell.state[0]).join("")).join("/");
+}
+
+function updateStableSignature(
+  signature: string,
+  ref: { current: { signature: string; count: number } },
+): number {
+  if (ref.current.signature === signature) {
+    ref.current = { signature, count: ref.current.count + 1 };
+  } else {
+    ref.current = { signature, count: 1 };
+  }
+  return ref.current.count;
+}
+
+function hasColoredTiles(grid: Grid): boolean {
+  return grid.some((row) => row.some((cell) => cell.state !== "blank"));
+}
+
+function hasCompleteRecognizedLetters(grid: Grid): boolean {
+  const rowsWithColors = grid.filter((row) => row.some((cell) => cell.state !== "blank"));
+  return (
+    rowsWithColors.length > 0 &&
+    rowsWithColors.every((row) =>
+      row.every((cell) => cell.state === "blank" || /^[A-Z]$/.test(cell.letter)),
+    )
+  );
+}
+
+function mergeGridStates(current: Grid, nextStates: Grid): Grid {
+  return nextStates.map((row, rowIndex) =>
+    row.map((cell, colIndex) => {
+      const previous = current[rowIndex]?.[colIndex];
+      const isSameState = previous?.state === cell.state;
+      return {
+        letter: cell.state === "blank" ? "" : (previous?.letter ?? ""),
+        state: cell.state,
+        confidence: isSameState ? previous?.confidence : undefined,
+      };
+    }),
   );
 }
 

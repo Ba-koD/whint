@@ -263,7 +263,7 @@ button {
 
 .import-actions {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 10px;
 }
 
@@ -287,6 +287,12 @@ button {
   background: rgba(26, 32, 40, 0.68);
 }
 
+.screen-button.is-live {
+  border-color: rgba(106, 170, 100, 0.82);
+  color: #e7f8e4;
+  background: rgba(73, 119, 70, 0.5);
+}
+
 .file-button {
   position: relative;
   overflow: hidden;
@@ -301,6 +307,27 @@ button {
 
 .paste-chip {
   color: #b9c2cf;
+}
+
+.live-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 14px;
+  color: #d9f4d5;
+  font-size: 0.9rem;
+}
+
+.live-status span {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #6aaa64;
+  box-shadow: 0 0 0 4px rgba(106, 170, 100, 0.12);
+}
+
+.live-status strong {
+  font-weight: 750;
 }
 
 .progress-wrap {
@@ -594,6 +621,13 @@ button {
   }
 }
 
+@media (max-width: 560px) {
+  .import-actions {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px;
+  }
+}
+
 @media (max-width: 420px) {
   .app-shell {
     width: min(100% - 14px, 620px);
@@ -605,6 +639,7 @@ button {
   }
 
   .import-actions {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
     gap: 7px;
   }
 
