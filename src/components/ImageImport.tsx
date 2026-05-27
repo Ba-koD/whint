@@ -93,7 +93,7 @@ export function ImageImport({
         </button>
         <button
           className="icon-button ghost-button"
-          disabled={isBusy && isScreenSharing}
+          disabled={isBusy && !isScreenSharing}
           type="button"
           onClick={isScreenSharing ? onForceScreenRecognition : onClear}
         >

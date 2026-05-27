@@ -2,10 +2,6 @@ import type { CellState, Grid } from "./types";
 import { getCachedWords } from "./wordData";
 import { createEmptyGrid, MAX_GUESSES, WORD_LENGTH } from "./wordle";
 
-type TesseractModule = typeof import("tesseract.js");
-type TesseractWorker = Awaited<ReturnType<TesseractModule["createWorker"]>>;
-type TesseractPsm = TesseractModule["PSM"];
-
 interface Rgb {
   r: number;
   g: number;
@@ -60,21 +56,23 @@ interface GridCandidate {
 
 interface LetterTemplate {
   letter: string;
-  source: "keyboard" | "rendered";
+  source: "keyboard" | "stored" | "rendered";
   mask: Uint8Array;
   dilatedMask: Uint8Array;
   active: number[];
+  rowProfile: Uint8Array;
+  colProfile: Uint8Array;
 }
 
 interface TemplateMatch {
   letter: string;
-  source: "keyboard" | "rendered" | "";
+  source: LetterTemplate["source"] | "";
   score: number;
   margin: number;
 }
 
 export interface RecognitionProgress {
-  phase: "image" | "ocr" | "done";
+  phase: "image" | "letters" | "done";
   message: string;
   progress: number;
 }
@@ -116,7 +114,16 @@ const TILE_BORDER_REFS: Rgb[] = [
 ];
 
 const TEMPLATE_SIZE = 32;
+const STORED_TEMPLATE_KEY = "whint.letterTemplates.v5";
+const STORED_TEMPLATE_VERSION = 5;
+const MIN_VALID_KEYBOARD_TEMPLATES = 20;
+const MAX_INVALID_KEYBOARD_TEMPLATES = 2;
+const KEYBOARD_TEMPLATE_SELF_SCORE = 0.48;
+const KEYBOARD_TEMPLATE_SELF_MARGIN = -0.02;
 const TEMPLATE_FONTS = [
+  'Franklin Gothic Heavy',
+  'Franklin Gothic Demi',
+  'Franklin Gothic Medium',
   'Arial Black',
   'Helvetica Neue',
   'Arial',
@@ -131,6 +138,8 @@ const KEYBOARD_ROWS = [
   { letters: "ZXCVBNM", minKeys: 7 },
 ];
 let letterTemplateCache: LetterTemplate[] | null = null;
+let storedTemplateCache: LetterTemplate[] | undefined;
+let validatedStoredTemplateCache: LetterTemplate[] | undefined;
 
 export async function recognizeBoardFromImage(
   file: Blob,
@@ -139,6 +148,31 @@ export async function recognizeBoardFromImage(
 ): Promise<RecognizedBoard> {
   const canvas = await blobToCanvas(file);
   return recognizeBoardFromCanvas(canvas, onProgress, options);
+}
+
+export function warmRecognitionTemplates() {
+  if (typeof window === "undefined") {
+    return;
+  }
+
+  const buildTemplates = () => {
+    try {
+      const templates = getLetterTemplates();
+      getValidatedStoredTemplates(templates);
+    } catch {
+      // Template warming is an optimization; normal recognition can still build them later.
+    }
+  };
+
+  const idleWindow = window as Window & {
+    requestIdleCallback?: (callback: () => void, options?: { timeout: number }) => number;
+  };
+
+  if (idleWindow.requestIdleCallback) {
+    idleWindow.requestIdleCallback(buildTemplates, { timeout: 1800 });
+  } else {
+    window.setTimeout(buildTemplates, 120);
+  }
 }
 
 export async function recognizeBoardFromCanvas(
@@ -175,7 +209,7 @@ export async function recognizeBoardFromCanvas(
     await recognizeLetters(canvas, filledBoxes, grid, onProgress);
     await correctRecognizedWords(grid);
   } catch (error) {
-    warnings.push(error instanceof Error ? error.message : "OCR 처리 중 오류가 발생했습니다.");
+    warnings.push(error instanceof Error ? error.message : "글자 인식 중 오류가 발생했습니다.");
   }
 
   onProgress?.({ phase: "done", message: "완료", progress: 1 });
@@ -815,212 +849,81 @@ async function recognizeLetters(
   grid: Grid,
   onProgress?: (progress: RecognitionProgress) => void,
 ): Promise<void> {
-  const Tesseract = await import("tesseract.js");
-  const worker = await Tesseract.createWorker("eng", Tesseract.OEM.DEFAULT, {
-    logger: (message) => {
-      if (message.status === "recognizing text") {
-        onProgress?.({
-          phase: "ocr",
-          message: "글자 인식",
-          progress: 0.25 + message.progress * 0.5,
-        });
-      }
-    },
-  });
+  const templates = getFrameLetterTemplates(source);
 
-  try {
-    const templates = getFrameLetterTemplates(source);
-    await worker.setParameters({
-      tessedit_char_whitelist: "ABCDEFGHIJKLMNOPQRSTUVWXYZ",
-      tessedit_pageseg_mode: Tesseract.PSM.SINGLE_CHAR,
-      user_defined_dpi: "160",
+  for (let index = 0; index < boxes.length; index += 1) {
+    const box = boxes[index];
+    const template = guessLetterByTemplate(source, box, templates);
+    const shapeLetter = guessLetterByShape(source, box);
+    const result = chooseRecognizedLetter(shapeLetter, template);
+
+    grid[box.row][box.col] = {
+      ...grid[box.row][box.col],
+      letter: result.letter,
+      confidence: result.confidence,
+    };
+
+    onProgress?.({
+      phase: "letters",
+      message: "글자 인식",
+      progress: 0.25 + ((index + 1) / boxes.length) * 0.7,
     });
-
-    for (let index = 0; index < boxes.length; index += 1) {
-      const box = boxes[index];
-      const result = await recognizeCellLetter(worker, source, box, Tesseract.PSM);
-      const template = guessLetterByTemplate(source, box, templates);
-      const shapeLetter = guessLetterByShape(source, box);
-      const letter = chooseRecognizedLetter(result, shapeLetter, template);
-
-      grid[box.row][box.col] = {
-        ...grid[box.row][box.col],
-        letter,
-        confidence: result.confidence,
-      };
-
-      onProgress?.({
-        phase: "ocr",
-        message: "글자 인식",
-        progress: 0.75 + ((index + 1) / boxes.length) * 0.2,
-      });
-    }
-  } finally {
-    await worker.terminate();
   }
 }
 
 function chooseRecognizedLetter(
-  result: { letter: string; confidence: number },
   shapeLetter: string,
   template: TemplateMatch,
-): string {
-  if (!result.letter) {
-    return template.score >= 0.52 ? template.letter : shapeLetter;
+): { letter: string; confidence: number } {
+  if (!template.letter) {
+    return { letter: shapeLetter, confidence: shapeLetter ? 45 : 0 };
   }
 
-  if (isVeryStrongTemplateMatch(template) && result.letter !== template.letter) {
-    return template.letter;
-  }
+  const templateConfidence = Math.round(clamp(template.score * 100, 0, 99));
 
-  if (
-    template.source === "keyboard" &&
-    isStrongTemplateMatch(template) &&
-    result.letter !== template.letter
-  ) {
-    return template.letter;
-  }
+  if (shapeLetter && shapeLetter !== template.letter) {
+    if (isShapeOverride(shapeLetter, template)) {
+      return { letter: shapeLetter, confidence: Math.max(58, templateConfidence - 10) };
+    }
 
-  if (isStrongTemplateMatch(template) && result.letter !== template.letter) {
-    if (isKnownTemplateConfusion(template.letter, result.letter) || result.confidence < 88) {
-      return template.letter;
+    if (!isStrongTemplateMatch(template)) {
+      return { letter: shapeLetter, confidence: Math.max(50, templateConfidence) };
     }
   }
 
-  if (!shapeLetter || result.letter === shapeLetter) {
-    return result.letter;
+  if (isUsableTemplateMatch(template)) {
+    return { letter: template.letter, confidence: templateConfidence };
   }
 
-  if (shapeLetter === "O" && result.letter === "T") {
-    return shapeLetter;
+  if (shapeLetter) {
+    return { letter: shapeLetter, confidence: Math.max(42, templateConfidence) };
   }
 
-  if (shapeLetter === "U" && ["D", "V"].includes(result.letter)) {
-    return shapeLetter;
-  }
-
-  if (shapeLetter === "O" && ["D", "Q", "U"].includes(result.letter)) {
-    return result.confidence <= 82 ? shapeLetter : result.letter;
-  }
-
-  if (shapeLetter === "I" && ["L", "T", "J"].includes(result.letter)) {
-    return result.confidence <= 76 ? shapeLetter : result.letter;
-  }
-
-  return result.confidence < 55 ? shapeLetter : result.letter;
+  return { letter: template.score >= 0.5 ? template.letter : "", confidence: templateConfidence };
 }
 
-function isVeryStrongTemplateMatch(template: TemplateMatch): boolean {
-  if (template.source === "keyboard") {
-    return template.score >= 0.66 && template.margin >= 0.025;
+function isUsableTemplateMatch(template: TemplateMatch): boolean {
+  if (template.source === "keyboard" || template.source === "stored") {
+    return template.score >= 0.5 && template.margin >= 0.006;
   }
-  return template.score >= 0.72 && template.margin >= 0.055;
+  return template.score >= 0.56 && template.margin >= 0.012;
 }
 
 function isStrongTemplateMatch(template: TemplateMatch): boolean {
-  if (template.source === "keyboard") {
+  if (template.source === "keyboard" || template.source === "stored") {
     return template.score >= 0.58 && template.margin >= 0.015;
   }
   return template.score >= 0.62 && template.margin >= 0.025;
 }
 
-function isKnownTemplateConfusion(templateLetter: string, ocrLetter: string): boolean {
+function isShapeOverride(shapeLetter: string, template: TemplateMatch): boolean {
   return (
-    (templateLetter === "U" && ["D", "V"].includes(ocrLetter)) ||
-    (templateLetter === "D" && ["O", "U"].includes(ocrLetter)) ||
-    (templateLetter === "O" && ["D", "Q", "T", "U"].includes(ocrLetter)) ||
-    (templateLetter === "I" && ["L", "T", "J"].includes(ocrLetter)) ||
-    (templateLetter === "S" && ["R", "Z"].includes(ocrLetter)) ||
-    (templateLetter === "R" && ["S", "P"].includes(ocrLetter))
+    (shapeLetter === "D" && ["O", "Q", "U"].includes(template.letter)) ||
+    (shapeLetter === "O" && ["D", "T", "U"].includes(template.letter)) ||
+    (shapeLetter === "U" && ["D", "O", "Y"].includes(template.letter)) ||
+    (shapeLetter === "V" && ["E", "M", "W", "U"].includes(template.letter)) ||
+    (shapeLetter === "I" && ["D", "O", "Q", "L", "T", "J"].includes(template.letter))
   );
-}
-
-async function recognizeCellLetter(
-  worker: TesseractWorker,
-  source: HTMLCanvasElement,
-  box: TileBox,
-  psm: TesseractPsm,
-): Promise<{ letter: string; confidence: number }> {
-  const variants = createLetterCanvases(source, box);
-  let best = { letter: "", confidence: 0 };
-
-  for (const mode of [psm.SINGLE_CHAR, psm.SINGLE_WORD]) {
-    await worker.setParameters({ tessedit_pageseg_mode: mode });
-    for (const canvas of variants) {
-      const result = await worker.recognize(canvas);
-      const letter = result.data.text.toUpperCase().match(/[A-Z]/)?.[0] ?? "";
-      const confidence = Number.isFinite(result.data.confidence) ? result.data.confidence : 0;
-      if (letter && confidence > best.confidence) {
-        best = { letter, confidence };
-      }
-      if (letter && confidence >= 45) {
-        return best;
-      }
-    }
-  }
-
-  return best.confidence >= 30 ? best : { letter: "", confidence: best.confidence };
-}
-
-function createLetterCanvases(source: HTMLCanvasElement, box: TileBox): HTMLCanvasElement[] {
-  return [
-    cropLetterCanvas(source, box, { insetRatio: 0.08, padding: 0, binary: true, size: 128 }),
-    cropLetterCanvas(source, box, { insetRatio: 0, padding: 0, binary: true, size: 128 }),
-    cropLetterCanvas(source, box, { insetRatio: 0, padding: 18, binary: true, size: 128 }),
-    cropLetterCanvas(source, box, { insetRatio: 0.08, padding: 0, binary: false, size: 128 }),
-  ];
-}
-
-function cropLetterCanvas(
-  source: HTMLCanvasElement,
-  box: TileBox,
-  options: { insetRatio: number; padding: number; binary: boolean; size: number },
-): HTMLCanvasElement {
-  const canvas = document.createElement("canvas");
-  const size = options.size;
-  canvas.width = size;
-  canvas.height = size;
-  const ctx = canvas.getContext("2d", { willReadFrequently: true });
-  if (!ctx) {
-    throw new Error("OCR 캔버스를 초기화할 수 없습니다.");
-  }
-
-  const inset = Math.round(box.size * options.insetRatio);
-  const destinationSize = size - options.padding * 2;
-  ctx.fillStyle = "#fff";
-  ctx.fillRect(0, 0, size, size);
-  ctx.imageSmoothingEnabled = true;
-  ctx.drawImage(
-    source,
-    box.left + inset,
-    box.top + inset,
-    box.size - inset * 2,
-    box.size - inset * 2,
-    options.padding,
-    options.padding,
-    destinationSize,
-    destinationSize,
-  );
-
-  if (!options.binary) {
-    return canvas;
-  }
-
-  const image = ctx.getImageData(0, 0, size, size);
-  for (let index = 0; index < image.data.length; index += 4) {
-    const r = image.data[index];
-    const g = image.data[index + 1];
-    const b = image.data[index + 2];
-    const isLetter = r > 175 && g > 175 && b > 175;
-    const value = isLetter ? 0 : 255;
-    image.data[index] = value;
-    image.data[index + 1] = value;
-    image.data[index + 2] = value;
-    image.data[index + 3] = 255;
-  }
-  ctx.putImageData(image, 0, 0);
-
-  return canvas;
 }
 
 function guessLetterByTemplate(
@@ -1036,11 +939,18 @@ function guessLetterByTemplate(
   const sample = pointsToMask(points, TEMPLATE_SIZE);
   const sampleDilated = dilateMask(sample.mask, TEMPLATE_SIZE);
   const scoresByLetter = new Map<string, { score: number; source: LetterTemplate["source"] }>();
+  const sampleTemplate: LetterTemplate = {
+    letter: "",
+    source: "rendered",
+    mask: sample.mask,
+    dilatedMask: sampleDilated,
+    active: sample.active,
+    rowProfile: sample.rowProfile,
+    colProfile: sample.colProfile,
+  };
 
   for (const template of templates) {
-    const forward = coverage(sample.active, template.dilatedMask);
-    const backward = coverage(template.active, sampleDilated);
-    const score = (forward + backward) / 2;
+    const score = scoreTemplateMatch(sampleTemplate, template);
     const current = scoresByLetter.get(template.letter);
     if (!current || score > current.score) {
       scoresByLetter.set(template.letter, { score, source: template.source });
@@ -1059,15 +969,231 @@ function guessLetterByTemplate(
 }
 
 function getFrameLetterTemplates(source: HTMLCanvasElement): LetterTemplate[] {
-  const keyboardTemplates = extractKeyboardLetterTemplates(source);
   const fallbackTemplates = getLetterTemplates();
-  if (keyboardTemplates.length === 0) {
-    return fallbackTemplates;
+  const keyboardTemplates = validateKeyboardTemplates(
+    extractKeyboardLetterTemplates(source),
+    fallbackTemplates,
+  );
+  if (keyboardTemplates.length >= MIN_VALID_KEYBOARD_TEMPLATES) {
+    saveStoredLetterTemplates(keyboardTemplates);
   }
 
-  const keyboardLetters = new Set(keyboardTemplates.map((template) => template.letter));
-  const missingFallbacks = fallbackTemplates.filter((template) => !keyboardLetters.has(template.letter));
-  return [...keyboardTemplates, ...missingFallbacks];
+  const templates: LetterTemplate[] = [...keyboardTemplates];
+  const coveredLetters = new Set(templates.map((template) => template.letter));
+
+  if (coveredLetters.size < LETTERS.length) {
+    for (const template of getValidatedStoredTemplates(fallbackTemplates)) {
+      if (!coveredLetters.has(template.letter)) {
+        templates.push(template);
+        coveredLetters.add(template.letter);
+      }
+    }
+  }
+
+  return [...templates, ...fallbackTemplates];
+}
+
+function getValidatedStoredTemplates(fallbackTemplates: LetterTemplate[]): LetterTemplate[] {
+  if (validatedStoredTemplateCache !== undefined) {
+    return validatedStoredTemplateCache;
+  }
+
+  validatedStoredTemplateCache = validateKeyboardTemplates(loadStoredLetterTemplates(), fallbackTemplates);
+  return validatedStoredTemplateCache;
+}
+
+function validateKeyboardTemplates(
+  templates: LetterTemplate[],
+  fallbackTemplates: LetterTemplate[],
+): LetterTemplate[] {
+  if (templates.length < MIN_VALID_KEYBOARD_TEMPLATES) {
+    return [];
+  }
+
+  const validated: LetterTemplate[] = [];
+  let invalidCount = 0;
+
+  for (const template of templates) {
+    const match = classifyTemplateByFallback(template, fallbackTemplates);
+    const isValid =
+      match.letter === template.letter &&
+      match.score >= KEYBOARD_TEMPLATE_SELF_SCORE &&
+      match.margin >= KEYBOARD_TEMPLATE_SELF_MARGIN;
+
+    if (isValid) {
+      validated.push(template);
+    } else {
+      invalidCount += 1;
+    }
+  }
+
+  if (
+    validated.length < MIN_VALID_KEYBOARD_TEMPLATES ||
+    invalidCount > MAX_INVALID_KEYBOARD_TEMPLATES
+  ) {
+    return [];
+  }
+
+  return validated;
+}
+
+function classifyTemplateByFallback(
+  sample: LetterTemplate,
+  fallbackTemplates: LetterTemplate[],
+): TemplateMatch {
+  const scoresByLetter = new Map<string, number>();
+
+  for (const template of fallbackTemplates) {
+    const score = scoreTemplateMatch(sample, template);
+    const current = scoresByLetter.get(template.letter);
+    if (current === undefined || score > current) {
+      scoresByLetter.set(template.letter, score);
+    }
+  }
+
+  const ranked = [...scoresByLetter.entries()].sort((a, b) => b[1] - a[1]);
+  const [letter, score] = ranked[0] ?? ["", 0];
+  const secondScore = ranked[1]?.[1] ?? 0;
+  return {
+    letter,
+    source: "rendered",
+    score,
+    margin: score - secondScore,
+  };
+}
+
+function scoreTemplateMatch(sample: LetterTemplate, template: LetterTemplate): number {
+  const forward = coverage(sample.active, template.dilatedMask);
+  const backward = coverage(template.active, sample.dilatedMask);
+  const maskScore = (forward + backward) / 2;
+  const rowScore = profileSimilarity(sample.rowProfile, template.rowProfile);
+  const colScore = profileSimilarity(sample.colProfile, template.colProfile);
+  const profileScore = (rowScore + colScore) / 2;
+  return maskScore * 0.72 + profileScore * 0.28;
+}
+
+function profileSimilarity(first: Uint8Array, second: Uint8Array): number {
+  let difference = 0;
+  let scale = 0;
+
+  for (let index = 0; index < TEMPLATE_SIZE; index += 1) {
+    const firstCount = first[index];
+    const secondCount = second[index];
+    difference += Math.abs(firstCount - secondCount);
+    scale += Math.max(firstCount, secondCount);
+  }
+
+  return scale === 0 ? 0 : 1 - difference / scale;
+}
+
+function saveStoredLetterTemplates(templates: LetterTemplate[]) {
+  if (typeof localStorage === "undefined") {
+    return;
+  }
+
+  const merged = new Map(loadStoredLetterTemplates().map((template) => [template.letter, template]));
+  for (const template of templates) {
+    merged.set(template.letter, template);
+  }
+
+  const orderedTemplates = LETTERS.split("")
+    .map((letter) => merged.get(letter))
+    .filter((template): template is LetterTemplate => Boolean(template));
+
+  try {
+    localStorage.setItem(
+      STORED_TEMPLATE_KEY,
+      JSON.stringify({
+        version: STORED_TEMPLATE_VERSION,
+        size: TEMPLATE_SIZE,
+        templates: orderedTemplates.map((template) => ({
+          letter: template.letter,
+          mask: maskToString(template.mask),
+        })),
+      }),
+    );
+    storedTemplateCache = orderedTemplates.map((template) => ({
+      ...template,
+      source: "stored",
+    }));
+    validatedStoredTemplateCache = undefined;
+  } catch {
+    // Storage can fail in private mode or when quota is unavailable.
+  }
+}
+
+function loadStoredLetterTemplates(): LetterTemplate[] {
+  if (storedTemplateCache !== undefined) {
+    return storedTemplateCache;
+  }
+
+  storedTemplateCache = [];
+  if (typeof localStorage === "undefined") {
+    return storedTemplateCache;
+  }
+
+  try {
+    const raw = localStorage.getItem(STORED_TEMPLATE_KEY);
+    if (!raw) {
+      return storedTemplateCache;
+    }
+
+    const parsed = JSON.parse(raw) as {
+      version?: number;
+      size?: number;
+      templates?: Array<{ letter?: string; mask?: string }>;
+    };
+
+    if (
+      parsed.version !== STORED_TEMPLATE_VERSION ||
+      parsed.size !== TEMPLATE_SIZE ||
+      !Array.isArray(parsed.templates)
+    ) {
+      return storedTemplateCache;
+    }
+
+    storedTemplateCache = parsed.templates
+      .map((template) => restoreStoredLetterTemplate(template.letter, template.mask))
+      .filter((template): template is LetterTemplate => Boolean(template));
+    return storedTemplateCache;
+  } catch {
+    return storedTemplateCache;
+  }
+}
+
+function restoreStoredLetterTemplate(letter: unknown, encodedMask: unknown): LetterTemplate | null {
+  if (
+    typeof letter !== "string" ||
+    !LETTERS.includes(letter) ||
+    typeof encodedMask !== "string" ||
+    encodedMask.length !== TEMPLATE_SIZE * TEMPLATE_SIZE ||
+    /[^01]/.test(encodedMask)
+  ) {
+    return null;
+  }
+
+  const mask = new Uint8Array(TEMPLATE_SIZE * TEMPLATE_SIZE);
+  for (let index = 0; index < encodedMask.length; index += 1) {
+    mask[index] = encodedMask[index] === "1" ? 1 : 0;
+  }
+
+  return {
+    letter,
+    source: "stored",
+    mask,
+    dilatedMask: dilateMask(mask, TEMPLATE_SIZE),
+    active: activeIndexes(mask),
+    rowProfile: buildMaskProfile(mask, "row"),
+    colProfile: buildMaskProfile(mask, "column"),
+  };
+}
+
+function maskToString(mask: Uint8Array): string {
+  let result = "";
+  for (const value of mask) {
+    result += value ? "1" : "0";
+  }
+  return result;
 }
 
 function extractKeyboardLetterTemplates(source: HTMLCanvasElement): LetterTemplate[] {
@@ -1200,6 +1326,7 @@ function findKeyboardKeyComponents(
 function isKeyboardKeyPixel(pixel: Rgb): boolean {
   return (
     isFilledTilePixel(pixel) ||
+    isNearColor(pixel, { r: 211, g: 214, b: 218 }, 50) ||
     isNearColor(pixel, { r: 129, g: 131, b: 132 }, 52) ||
     isNearColor(pixel, { r: 86, g: 87, b: 88 }, 48) ||
     isNearColor(pixel, { r: 58, g: 58, b: 60 }, 42)
@@ -1247,6 +1374,8 @@ function createKeyboardLetterTemplate(
   const points: Array<{ x: number; y: number }> = [];
   const insetX = Math.round(key.width * 0.12);
   const insetY = Math.round(key.height * 0.12);
+  const background = sampleKeyBackground(image, key.width, key.height);
+  const backgroundLuma = luminance(background);
 
   for (let y = insetY; y < key.height - insetY; y += 1) {
     for (let x = insetX; x < key.width - insetX; x += 1) {
@@ -1254,7 +1383,8 @@ function createKeyboardLetterTemplate(
       const r = image.data[index];
       const g = image.data[index + 1];
       const b = image.data[index + 2];
-      if (r > 185 && g > 185 && b > 185) {
+      const pixelLuma = luminance({ r, g, b });
+      if (Math.abs(pixelLuma - backgroundLuma) > 52) {
         points.push({ x, y });
       }
     }
@@ -1271,7 +1401,48 @@ function createKeyboardLetterTemplate(
     mask: normalized.mask,
     dilatedMask: dilateMask(normalized.mask, TEMPLATE_SIZE),
     active: normalized.active,
+    rowProfile: normalized.rowProfile,
+    colProfile: normalized.colProfile,
   };
+}
+
+function sampleKeyBackground(image: ImageData, width: number, height: number): Rgb {
+  const samples: Rgb[] = [];
+  const sampleWidth = Math.max(2, Math.round(width * 0.16));
+  const sampleHeight = Math.max(2, Math.round(height * 0.18));
+  const regions = [
+    { left: 1, top: 1 },
+    { left: Math.max(1, width - sampleWidth - 1), top: 1 },
+    { left: 1, top: Math.max(1, height - sampleHeight - 1) },
+    { left: Math.max(1, width - sampleWidth - 1), top: Math.max(1, height - sampleHeight - 1) },
+  ];
+
+  for (const region of regions) {
+    for (let y = region.top; y < Math.min(height, region.top + sampleHeight); y += 1) {
+      for (let x = region.left; x < Math.min(width, region.left + sampleWidth); x += 1) {
+        const index = (y * width + x) * 4;
+        samples.push({
+          r: image.data[index],
+          g: image.data[index + 1],
+          b: image.data[index + 2],
+        });
+      }
+    }
+  }
+
+  if (samples.length === 0) {
+    return { r: 0, g: 0, b: 0 };
+  }
+
+  return {
+    r: samples.reduce((sum, pixel) => sum + pixel.r, 0) / samples.length,
+    g: samples.reduce((sum, pixel) => sum + pixel.g, 0) / samples.length,
+    b: samples.reduce((sum, pixel) => sum + pixel.b, 0) / samples.length,
+  };
+}
+
+function luminance(pixel: Rgb): number {
+  return pixel.r * 0.2126 + pixel.g * 0.7152 + pixel.b * 0.0722;
 }
 
 function getLetterTemplates(): LetterTemplate[] {
@@ -1306,7 +1477,7 @@ function renderLetterTemplate(letter: string, font: string): LetterTemplate | nu
   ctx.fillStyle = "#fff";
   ctx.textAlign = "center";
   ctx.textBaseline = "middle";
-  ctx.font = `900 92px ${font.includes(" ") ? `"${font}"` : font}`;
+  ctx.font = `700 100px ${font.includes(" ") ? `"${font}"` : font}`;
   ctx.fillText(letter, size / 2, size / 2 + 5);
 
   const image = ctx.getImageData(0, 0, size, size);
@@ -1331,13 +1502,15 @@ function renderLetterTemplate(letter: string, font: string): LetterTemplate | nu
     mask: normalized.mask,
     dilatedMask: dilateMask(normalized.mask, TEMPLATE_SIZE),
     active: normalized.active,
+    rowProfile: normalized.rowProfile,
+    colProfile: normalized.colProfile,
   };
 }
 
 function pointsToMask(
   points: Array<{ x: number; y: number }>,
   size: number,
-): { mask: Uint8Array; active: number[] } {
+): { mask: Uint8Array; active: number[]; rowProfile: Uint8Array; colProfile: Uint8Array } {
   const xs = points.map((point) => point.x);
   const ys = points.map((point) => point.y);
   const minX = Math.min(...xs);
@@ -1354,7 +1527,28 @@ function pointsToMask(
     mask[y * size + x] = 1;
   }
 
-  return { mask, active: activeIndexes(mask) };
+  return {
+    mask,
+    active: activeIndexes(mask),
+    rowProfile: buildMaskProfile(mask, "row"),
+    colProfile: buildMaskProfile(mask, "column"),
+  };
+}
+
+function buildMaskProfile(mask: Uint8Array, direction: "row" | "column"): Uint8Array {
+  const profile = new Uint8Array(TEMPLATE_SIZE);
+
+  for (let outer = 0; outer < TEMPLATE_SIZE; outer += 1) {
+    let count = 0;
+    for (let inner = 0; inner < TEMPLATE_SIZE; inner += 1) {
+      const index =
+        direction === "row" ? outer * TEMPLATE_SIZE + inner : inner * TEMPLATE_SIZE + outer;
+      count += mask[index];
+    }
+    profile[outer] = count;
+  }
+
+  return profile;
 }
 
 function activeIndexes(mask: Uint8Array): number[] {
@@ -1419,6 +1613,8 @@ function getLetterPoints(source: HTMLCanvasElement, box: TileBox): Array<{ x: nu
   const image = ctx.getImageData(left, top, size, size);
   const points: Array<{ x: number; y: number }> = [];
   const margin = Math.round(size * 0.08);
+  const background = sampleKeyBackground(image, size, size);
+  const backgroundLuma = luminance(background);
 
   for (let y = margin; y < size - margin; y += 1) {
     for (let x = margin; x < size - margin; x += 1) {
@@ -1426,13 +1622,24 @@ function getLetterPoints(source: HTMLCanvasElement, box: TileBox): Array<{ x: nu
       const r = image.data[index];
       const g = image.data[index + 1];
       const b = image.data[index + 2];
-      if (r > 175 && g > 175 && b > 175) {
+      if (isLetterPixel({ r, g, b }, background, backgroundLuma)) {
         points.push({ x, y });
       }
     }
   }
 
   return points;
+}
+
+function isLetterPixel(pixel: Rgb, background: Rgb, backgroundLuma: number): boolean {
+  const pixelLuma = luminance(pixel);
+  const distance = colorDistance(pixel, background);
+
+  if (backgroundLuma > 210) {
+    return pixelLuma < backgroundLuma - 45 && distance > 45;
+  }
+
+  return pixelLuma > backgroundLuma + 30 && distance > 36;
 }
 
 export function classifyLetterShape(
@@ -1481,32 +1688,148 @@ export function classifyLetterShape(
     minY + height * 0.28,
     maxY - height * 0.16,
   );
+  const topLeft = ratioInRegion(
+    points,
+    minX,
+    minX + width * 0.32,
+    minY,
+    minY + height * 0.26,
+  );
+  const topRight = ratioInRegion(
+    points,
+    maxX - width * 0.32,
+    maxX,
+    minY,
+    minY + height * 0.26,
+  );
+  const bottomLeft = ratioInRegion(
+    points,
+    minX,
+    minX + width * 0.34,
+    maxY - height * 0.24,
+    maxY,
+  );
+  const bottomRight = ratioInRegion(
+    points,
+    maxX - width * 0.34,
+    maxX,
+    maxY - height * 0.24,
+    maxY,
+  );
+  const center = ratioInRegion(
+    points,
+    minX + width * 0.34,
+    maxX - width * 0.34,
+    minY + height * 0.34,
+    maxY - height * 0.34,
+  );
+  const midLeft = ratioInRegion(
+    points,
+    minX,
+    minX + width * 0.24,
+    minY + height * 0.34,
+    maxY - height * 0.34,
+  );
+  const midRight = ratioInRegion(
+    points,
+    maxX - width * 0.24,
+    maxX,
+    minY + height * 0.34,
+    maxY - height * 0.34,
+  );
+  const topFull = ratioInRegion(points, minX, maxX, minY, minY + height * 0.22);
+  const midFull = ratioInRegion(
+    points,
+    minX,
+    maxX,
+    minY + height * 0.38,
+    minY + height * 0.62,
+  );
+  const bottomFull = ratioInRegion(points, minX, maxX, maxY - height * 0.22, maxY);
+  const leftFull = ratioInRegion(points, minX, minX + width * 0.24, minY, maxY);
+  const rightFull = ratioInRegion(points, maxX - width * 0.24, maxX, minY, maxY);
+  const bottomRightLower = ratioInRegion(
+    points,
+    maxX - width * 0.38,
+    maxX,
+    maxY - height * 0.28,
+    maxY,
+  );
 
   if (aspect < 0.45 && height > tileSize * 0.36 && fill > 0.42) {
     return "I";
   }
 
   if (
+    aspect >= 0.5 &&
+    aspect <= 0.72 &&
+    fill >= 0.52 &&
+    fill <= 0.76 &&
+    leftFull > 0.7 &&
+    rightFull < 0.5 &&
+    topFull > 0.45 &&
+    midFull > 0.45 &&
+    bottomFull > 0.45 &&
+    bottomRightLower > 0.16
+  ) {
+    return "E";
+  }
+
+  if (
+    aspect >= 0.62 &&
+    aspect <= 1.18 &&
+    fill >= 0.16 &&
+    fill <= 0.52 &&
+    topMiddle < 0.14 &&
+    topLeft > 0.06 &&
+    topRight > 0.06 &&
+    bottomMiddle > 0.08 &&
+    bottomLeft < 0.16 &&
+    bottomRight < 0.16
+  ) {
+    return "V";
+  }
+
+  if (
+    aspect >= 0.58 &&
+    aspect <= 1.08 &&
+    fill >= 0.48 &&
+    fill <= 0.82 &&
+    center < 0.12 &&
+    topMiddle > 0.18 &&
+    topLeft > 0.68 &&
+    bottomLeft > 0.64 &&
+    topRight > 0.24 &&
+    bottomRight > 0.22
+  ) {
+    return "D";
+  }
+
+  if (
     aspect >= 0.56 &&
     aspect <= 1.05 &&
     fill >= 0.2 &&
-    fill <= 0.62 &&
+    fill <= 0.76 &&
     topMiddle < 0.08 &&
     bottomMiddle > 0.16 &&
+    bottomLeft > 0.18 &&
+    bottomRight > 0.18 &&
     leftLower > 0.16 &&
     rightLower > 0.16
   ) {
     return "U";
   }
 
-  if (aspect >= 0.68 && aspect <= 1.22 && fill >= 0.22 && fill <= 0.7) {
-    const center = ratioInRegion(
-      points,
-      minX + width * 0.34,
-      maxX - width * 0.34,
-      minY + height * 0.34,
-      maxY - height * 0.34,
-    );
+  if (
+    aspect >= 0.68 &&
+    aspect <= 1.22 &&
+    fill >= 0.22 &&
+    fill <= 0.7 &&
+    topMiddle > 0.18 &&
+    bottomMiddle > 0.18 &&
+    midLeft > 0.3 &&
+    midRight > 0.3
+  ) {
     if (center < 0.1) {
       return "O";
     }

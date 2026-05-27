@@ -6,6 +6,7 @@ import {
   recognizeBoardFromCanvas,
   recognizeBoardFromImage,
   type RecognitionProgress,
+  warmRecognitionTemplates,
 } from "./lib/imageRecognition";
 import type { CellState, Grid, WordSource } from "./lib/types";
 import {
@@ -21,8 +22,8 @@ import { loadWordData } from "./lib/wordData";
 const STORAGE_KEY = "whint.state.v1";
 const LIVE_CAPTURE_INTERVAL_MS = 1600;
 const LIVE_CAPTURE_MAX_EDGE = 1800;
-const LIVE_OCR_RETRY_INTERVAL_MS = 8000;
-const LIVE_OCR_REFRESH_INTERVAL_MS = 12000;
+const LIVE_LETTER_RETRY_INTERVAL_MS = 8000;
+const LIVE_LETTER_REFRESH_INTERVAL_MS = 12000;
 const LIVE_STABLE_FRAME_DELAY_MS = 450;
 const LIVE_REQUIRED_STABLE_FRAMES = 2;
 
@@ -47,10 +48,14 @@ export default function App() {
   const screenVideoRef = useRef<HTMLVideoElement | null>(null);
   const liveRecognizedSignatureRef = useRef("");
   const liveRecognizedAtRef = useRef(0);
-  const liveOcrAttemptRef = useRef<{ signature: string; time: number } | null>(null);
+  const liveLetterAttemptRef = useRef<{ signature: string; time: number } | null>(null);
   const livePendingSignatureRef = useRef({ signature: "", count: 0 });
+  const forceNextLiveRecognitionRef = useRef(false);
+  const liveRunGenerationRef = useRef(0);
 
   useEffect(() => {
+    warmRecognitionTemplates();
+
     loadWordData()
       .then((data) => {
         setWords(data.words);
@@ -159,6 +164,7 @@ export default function App() {
   }, []);
 
   const stopScreenShare = useCallback(() => {
+    liveRunGenerationRef.current += 1;
     const stream = screenStreamRef.current;
     screenStreamRef.current = null;
     stream?.getTracks().forEach((track) => track.stop());
@@ -173,8 +179,9 @@ export default function App() {
 
     liveRecognizedSignatureRef.current = "";
     liveRecognizedAtRef.current = 0;
-    liveOcrAttemptRef.current = null;
+    liveLetterAttemptRef.current = null;
     livePendingSignatureRef.current = { signature: "", count: 0 };
+    forceNextLiveRecognitionRef.current = false;
     setIsScreenSharing(false);
     setIsRecognizing(false);
     setProgress(null);
@@ -201,10 +208,12 @@ export default function App() {
 
       screenStreamRef.current = stream;
       screenVideoRef.current = video;
+      liveRunGenerationRef.current += 1;
       liveRecognizedSignatureRef.current = "";
       liveRecognizedAtRef.current = 0;
-      liveOcrAttemptRef.current = null;
+      liveLetterAttemptRef.current = null;
       livePendingSignatureRef.current = { signature: "", count: 0 };
+      forceNextLiveRecognitionRef.current = false;
       stream.getVideoTracks().forEach((track) => {
         track.addEventListener("ended", stopScreenShare, { once: true });
       });
@@ -232,7 +241,11 @@ export default function App() {
 
     liveRecognizedSignatureRef.current = "";
     liveRecognizedAtRef.current = 0;
-    liveOcrAttemptRef.current = null;
+    liveLetterAttemptRef.current = null;
+    livePendingSignatureRef.current = { signature: "", count: 0 };
+    forceNextLiveRecognitionRef.current = true;
+    liveRunGenerationRef.current += 1;
+    setGrid(createEmptyGrid());
     setWarnings([]);
     setProgress({ phase: "image", message: "재인식 대기", progress: 0 });
     setLiveRecognitionRequestId((requestId) => requestId + 1);
@@ -245,15 +258,21 @@ export default function App() {
 
     let cancelled = false;
     let timeoutId: number | null = null;
+    const runGeneration = liveRunGenerationRef.current;
+    const isCurrentRun = () => !cancelled && runGeneration === liveRunGenerationRef.current;
 
     const queueNext = (delay = LIVE_CAPTURE_INTERVAL_MS) => {
-      if (!cancelled) {
+      if (isCurrentRun()) {
         timeoutId = window.setTimeout(run, delay);
       }
     };
 
     const run = async () => {
       let manuallyQueuedNext = false;
+      if (!isCurrentRun()) {
+        return;
+      }
+
       const video = screenVideoRef.current;
       if (
         !video ||
@@ -261,18 +280,22 @@ export default function App() {
         video.videoWidth === 0 ||
         video.videoHeight === 0
       ) {
-        timeoutId = window.setTimeout(run, 350);
+        if (isCurrentRun()) {
+          timeoutId = window.setTimeout(run, 350);
+        }
         return;
       }
 
       setIsRecognizing(true);
       setProgress({ phase: "image", message: "화면 분석", progress: 0.03 });
       try {
+        const forceFullRecognition = forceNextLiveRecognitionRef.current;
+        forceNextLiveRecognitionRef.current = false;
         const frame = captureVideoFrame(video);
         const preview = await recognizeBoardFromCanvas(
           frame,
           (nextProgress) => {
-            if (!cancelled) {
+            if (isCurrentRun()) {
               setProgress(nextProgress);
             }
           },
@@ -281,21 +304,27 @@ export default function App() {
         const signature = gridStateSignature(preview.grid);
         const now = Date.now();
         if (!hasColoredTiles(preview.grid)) {
-          if (!cancelled) {
+          if (isCurrentRun()) {
             setGrid(createEmptyGrid());
             setWarnings([]);
             liveRecognizedSignatureRef.current = "";
             liveRecognizedAtRef.current = 0;
-            liveOcrAttemptRef.current = null;
+            liveLetterAttemptRef.current = null;
             livePendingSignatureRef.current = { signature: "", count: 0 };
+            forceNextLiveRecognitionRef.current = false;
             setProgress({ phase: "done", message: "새 게임 감지", progress: 1 });
           }
           return;
         }
 
-        const stableCount = updateStableSignature(signature, livePendingSignatureRef);
+        const stableCount = forceFullRecognition
+          ? LIVE_REQUIRED_STABLE_FRAMES
+          : updateStableSignature(signature, livePendingSignatureRef);
+        if (forceFullRecognition) {
+          livePendingSignatureRef.current = { signature, count: LIVE_REQUIRED_STABLE_FRAMES };
+        }
         if (stableCount < LIVE_REQUIRED_STABLE_FRAMES) {
-          if (!cancelled) {
+          if (isCurrentRun()) {
             setGrid((current) => mergeGridStates(current, preview.grid));
             setWarnings(preview.warnings);
             setProgress({ phase: "image", message: "그리드 안정화", progress: 0.18 });
@@ -306,50 +335,52 @@ export default function App() {
         }
 
         if (
+          !forceFullRecognition &&
           signature === liveRecognizedSignatureRef.current &&
-          now - liveRecognizedAtRef.current < LIVE_OCR_REFRESH_INTERVAL_MS
+          now - liveRecognizedAtRef.current < LIVE_LETTER_REFRESH_INTERVAL_MS
         ) {
-          if (!cancelled) {
+          if (isCurrentRun()) {
             setWarnings(preview.warnings);
             setProgress({ phase: "done", message: "변경 없음", progress: 1 });
           }
           return;
         }
 
-        const lastAttempt = liveOcrAttemptRef.current;
+        const lastAttempt = liveLetterAttemptRef.current;
         if (
+          !forceFullRecognition &&
           lastAttempt?.signature === signature &&
-          now - lastAttempt.time < LIVE_OCR_RETRY_INTERVAL_MS
+          now - lastAttempt.time < LIVE_LETTER_RETRY_INTERVAL_MS
         ) {
-          if (!cancelled) {
+          if (isCurrentRun()) {
             setGrid((current) => mergeGridStates(current, preview.grid));
             setWarnings(preview.warnings);
-            setProgress({ phase: "done", message: "OCR 대기", progress: 1 });
+            setProgress({ phase: "done", message: "글자 인식 대기", progress: 1 });
           }
           return;
         }
 
-        liveOcrAttemptRef.current = { signature, time: now };
+        liveLetterAttemptRef.current = { signature, time: now };
         const result = await recognizeBoardFromCanvas(frame, (nextProgress) => {
-          if (!cancelled) {
+          if (isCurrentRun()) {
             setProgress(nextProgress);
           }
         });
-        if (!cancelled) {
+        if (isCurrentRun()) {
           setGrid(result.grid);
           setWarnings(result.warnings);
           if (hasCompleteRecognizedLetters(result.grid)) {
             liveRecognizedSignatureRef.current = signature;
             liveRecognizedAtRef.current = Date.now();
-            liveOcrAttemptRef.current = null;
+            liveLetterAttemptRef.current = null;
           }
         }
       } catch (error) {
-        if (!cancelled) {
+        if (isCurrentRun()) {
           setWarnings([error instanceof Error ? error.message : "화면 인식에 실패했습니다."]);
         }
       } finally {
-        if (!cancelled) {
+        if (isCurrentRun()) {
           setIsRecognizing(false);
           if (!manuallyQueuedNext) {
             queueNext();
