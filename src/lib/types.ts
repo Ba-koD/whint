@@ -16,7 +16,9 @@ export interface CompletedGuess {
 export interface Recommendation {
   word: string;
   score: number;
-  method: "entropy" | "frequency";
+  method: "elimination" | "frequency";
+  expectedRemaining?: number;
+  worstRemaining?: number;
 }
 
 export interface WordSource {

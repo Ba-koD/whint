@@ -86,7 +86,9 @@ export function ResultsPanel({ candidates, completedRows, grid, recommendations 
               <article className="word-card" key={item.word}>
                 <div className="word-card-meta">
                   <span>{index + 1}</span>
-                  <small>{item.score.toFixed(2)}</small>
+                  <small title={formatRecommendationTitle(item)}>
+                    {formatRecommendationScore(item)}
+                  </small>
                 </div>
                 <MiniWord word={item.word} states={getCandidateEvidence(item.word, grid)} />
               </article>
@@ -97,6 +99,25 @@ export function ResultsPanel({ candidates, completedRows, grid, recommendations 
       </section>
     </section>
   );
+}
+
+function formatRecommendationScore(item: Recommendation): string {
+  if (item.method === "elimination") {
+    return `-${Math.round(item.score).toLocaleString()}`;
+  }
+  return item.score.toFixed(2);
+}
+
+function formatRecommendationTitle(item: Recommendation): string {
+  if (item.method !== "elimination") {
+    return `score ${item.score.toFixed(2)}`;
+  }
+
+  const expectedRemaining = item.expectedRemaining ?? 0;
+  const worstRemaining = item.worstRemaining ?? 0;
+  return `평균 ${item.score.toFixed(1)}개 제거, 평균 ${expectedRemaining.toFixed(
+    1,
+  )}개 남음, 최악 ${Math.round(worstRemaining).toLocaleString()}개 남음`;
 }
 
 function MiniWord({

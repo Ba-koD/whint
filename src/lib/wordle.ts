@@ -4,10 +4,8 @@ export const WORD_LENGTH = 5;
 export const MAX_GUESSES = 6;
 
 const ACTIVE_STATES: Exclude<CellState, "blank">[] = ["absent", "present", "correct"];
-const ENTROPY_SOLVE_BONUS = 0.08;
-const ENTROPY_UNUSED_FREQUENCY_WEIGHT = 0.035;
-const ENTROPY_UNUSED_POSITION_WEIGHT = 0.025;
-const ENTROPY_UNUSED_COUNT_WEIGHT = 0.015;
+const FEEDBACK_PATTERN_COUNT = 3 ** WORD_LENGTH;
+const SOLVED_FEEDBACK_CODE = FEEDBACK_PATTERN_COUNT - 1;
 const FREQUENCY_POSITION_WEIGHT = 0.8;
 const FREQUENCY_COVERAGE_WEIGHT = 0.25;
 const FREQUENCY_UNUSED_FREQUENCY_WEIGHT = 0.65;
@@ -129,17 +127,29 @@ export function getRecommendations(words: string[], grid: Grid, limit = 30): Rec
   }
 
   if (candidates.length <= 1) {
-    return candidates.map((word) => ({ word, score: 1, method: "frequency" as const }));
+    return candidates.map((word) => ({
+      word,
+      score: candidates.length,
+      method: "elimination" as const,
+      expectedRemaining: 0,
+      worstRemaining: 0,
+    }));
   }
 
   const recommendations = (() => {
     if (candidates.length <= 250) {
-      return rankByEntropy(guesses, candidates, usedLetters);
+      return rankByExpectedElimination(guesses, candidates);
     }
     if (candidates.length <= 700) {
-      return rankByEntropy(buildProbePool(guesses, candidates, 650, usedLetters), candidates, usedLetters);
+      return rankByExpectedElimination(
+        buildProbePool(guesses, candidates, 650, usedLetters, true),
+        candidates,
+      );
     }
-    return rankByLetterFrequency(guesses, candidates, usedLetters);
+    return rankByExpectedElimination(
+      buildProbePool(guesses, candidates, 900, usedLetters, false),
+      candidates,
+    );
   })();
 
   return recommendations.slice(0, limit);
@@ -174,31 +184,39 @@ export function getCandidateEvidence(word: string, grid: Grid): Exclude<CellStat
   });
 }
 
-function rankByEntropy(
-  guesses: string[],
-  answers: string[],
-  usedLetters = new Set<string>(),
-): Recommendation[] {
+function rankByExpectedElimination(guesses: string[], answers: string[]): Recommendation[] {
   const answerSet = new Set(answers);
-  const stats = buildLetterStats(answers);
+  const answerCount = answers.length;
 
   return guesses
     .map((guess) => {
-      const buckets = new Map<string, number>();
+      const buckets = Array.from({ length: FEEDBACK_PATTERN_COUNT }, () => 0);
       for (const answer of answers) {
-        const key = feedbackFor(guess, answer).map(stateKey).join("");
-        buckets.set(key, (buckets.get(key) ?? 0) + 1);
+        buckets[feedbackCodeFor(guess, answer)] += 1;
       }
 
-      let entropy = 0;
-      for (const size of buckets.values()) {
-        const probability = size / answers.length;
-        entropy -= probability * Math.log2(probability);
+      let retainedCandidateTotal = 0;
+      let worstRemaining = 0;
+      for (let code = 0; code < buckets.length; code += 1) {
+        const size = buckets[code];
+        if (size === 0) {
+          continue;
+        }
+
+        const remainingAfterFeedback =
+          answerSet.has(guess) && code === SOLVED_FEEDBACK_CODE ? 0 : size;
+        retainedCandidateTotal += size * remainingAfterFeedback;
+        worstRemaining = Math.max(worstRemaining, remainingAfterFeedback);
       }
 
-      const solveBonus = answerSet.has(guess) ? ENTROPY_SOLVE_BONUS : 0;
-      const explorationBonus = scoreUnusedLetterCoverage(guess, stats, usedLetters);
-      return { word: guess, score: entropy + solveBonus + explorationBonus, method: "entropy" as const };
+      const expectedRemaining = retainedCandidateTotal / answerCount;
+      return {
+        word: guess,
+        score: answerCount - expectedRemaining,
+        method: "elimination" as const,
+        expectedRemaining,
+        worstRemaining,
+      };
     })
     .sort(compareRecommendations);
 }
@@ -208,12 +226,24 @@ function buildProbePool(
   candidates: string[],
   limit: number,
   usedLetters = new Set<string>(),
+  includeAllCandidates = false,
 ): string[] {
+  const rankedWords = rankByLetterFrequency(words, candidates, usedLetters)
+    .slice(0, limit)
+    .map((item) => item.word);
+
+  if (includeAllCandidates) {
+    return uniqueWords([...candidates, ...rankedWords]);
+  }
+
+  const candidateLimit = Math.max(80, Math.floor(limit * 0.25));
+  const rankedCandidates = rankByLetterFrequency(candidates, candidates, usedLetters)
+    .slice(0, candidateLimit)
+    .map((item) => item.word);
+
   return uniqueWords([
-    ...candidates,
-    ...rankByLetterFrequency(words, candidates, usedLetters)
-      .slice(0, limit)
-      .map((item) => item.word),
+    ...rankedCandidates,
+    ...rankedWords,
   ]);
 }
 
@@ -317,20 +347,6 @@ function getPositionCoverageScores(word: string, stats: LetterStats, usedLetters
   return { positionScore, unusedPositionScore };
 }
 
-function scoreUnusedLetterCoverage(word: string, stats: LetterStats, usedLetters: Set<string>): number {
-  const { unusedCoverageScore, unusedLetterCount } = getLetterCoverageScores(
-    new Set(word),
-    stats,
-    usedLetters,
-  );
-  const { unusedPositionScore } = getPositionCoverageScores(word, stats, usedLetters);
-  return (
-    unusedCoverageScore * ENTROPY_UNUSED_FREQUENCY_WEIGHT +
-    unusedPositionScore * ENTROPY_UNUSED_POSITION_WEIGHT +
-    unusedLetterCount * ENTROPY_UNUSED_COUNT_WEIGHT
-  );
-}
-
 function getUsedLetters(grid: Grid): Set<string> {
   const usedLetters = new Set<string>();
 
@@ -431,6 +447,17 @@ function countLetters(word: string, letter: string): number {
 function compareRecommendations(a: Recommendation, b: Recommendation): number {
   const scoreDifference = b.score - a.score;
   if (Math.abs(scoreDifference) <= 0.005) {
+    const worstRemainingDifference = (a.worstRemaining ?? Infinity) - (b.worstRemaining ?? Infinity);
+    if (!Number.isNaN(worstRemainingDifference) && worstRemainingDifference !== 0) {
+      return worstRemainingDifference;
+    }
+
+    const expectedRemainingDifference =
+      (a.expectedRemaining ?? Infinity) - (b.expectedRemaining ?? Infinity);
+    if (!Number.isNaN(expectedRemainingDifference) && expectedRemainingDifference !== 0) {
+      return expectedRemainingDifference;
+    }
+
     const duplicateDifference = repeatedLetterCount(a.word) - repeatedLetterCount(b.word);
     if (duplicateDifference !== 0) {
       return duplicateDifference;
@@ -447,13 +474,78 @@ function repeatedLetterCount(word: string): number {
   return WORD_LENGTH - new Set(word).size;
 }
 
-function stateKey(state: Exclude<CellState, "blank">): string {
-  switch (state) {
-    case "absent":
-      return "0";
-    case "present":
-      return "1";
-    case "correct":
-      return "2";
+function feedbackCodeFor(guess: string, answer: string): number {
+  let state0 = 0;
+  let state1 = 0;
+  let state2 = 0;
+  let state3 = 0;
+  let state4 = 0;
+  let remaining = "";
+
+  if (guess[0] === answer[0]) {
+    state0 = 2;
+  } else {
+    remaining += answer[0];
   }
+  if (guess[1] === answer[1]) {
+    state1 = 2;
+  } else {
+    remaining += answer[1];
+  }
+  if (guess[2] === answer[2]) {
+    state2 = 2;
+  } else {
+    remaining += answer[2];
+  }
+  if (guess[3] === answer[3]) {
+    state3 = 2;
+  } else {
+    remaining += answer[3];
+  }
+  if (guess[4] === answer[4]) {
+    state4 = 2;
+  } else {
+    remaining += answer[4];
+  }
+
+  if (state0 !== 2) {
+    const position = remaining.indexOf(guess[0]);
+    if (position !== -1) {
+      state0 = 1;
+      remaining = removeLetterAt(remaining, position);
+    }
+  }
+  if (state1 !== 2) {
+    const position = remaining.indexOf(guess[1]);
+    if (position !== -1) {
+      state1 = 1;
+      remaining = removeLetterAt(remaining, position);
+    }
+  }
+  if (state2 !== 2) {
+    const position = remaining.indexOf(guess[2]);
+    if (position !== -1) {
+      state2 = 1;
+      remaining = removeLetterAt(remaining, position);
+    }
+  }
+  if (state3 !== 2) {
+    const position = remaining.indexOf(guess[3]);
+    if (position !== -1) {
+      state3 = 1;
+      remaining = removeLetterAt(remaining, position);
+    }
+  }
+  if (state4 !== 2) {
+    const position = remaining.indexOf(guess[4]);
+    if (position !== -1) {
+      state4 = 1;
+    }
+  }
+
+  return (((state0 * 3 + state1) * 3 + state2) * 3 + state3) * 3 + state4;
+}
+
+function removeLetterAt(value: string, index: number): string {
+  return value.slice(0, index) + value.slice(index + 1);
 }
